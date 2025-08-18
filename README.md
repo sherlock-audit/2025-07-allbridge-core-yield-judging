@@ -1,169 +1,8 @@
-# Issue M-1: Rewards not deposited before transfers, leading to loss of funds 
-
-Source: https://github.com/sherlock-audit/2025-07-allbridge-core-yield-judging/issues/24 
-
-## Found by 
-0xAlix2, Afriaudit, Cybrid, DianitaLaMas, bjebcjbw, blockace, mussucal, tobi0x18
-
-### Summary
-
-When a user deposits into the Portfolio token, these deposits are deposited into a pool, they receive virtual tokens proportional to the value of their deposit. Over time, the pool may accumulate **rewards**. These rewards are **not automatically reflected** in the user’s virtual token balance until explicitly claimed via the `depositRewards()` or `subDepositRewards(index)` functions.
-
-This model is handled correctly in `withdraw(...)`, which begins by calling `depositRewards()` to ensure that all pending rewards are claimed and internal virtual balances are updated **before** any withdrawal amounts are computed or burned.
-
-However, in `_transfer(...)` and `_subTransfer(...)`, this step is missing.
-
-This means that if a user (say Alice) has accumulated rewards that have not yet been claimed via `depositRewards()`, and she transfers some balance to another user (say Bob), the system computes Alice’s virtual balance without those pending rewards.
-
-In other words, **the unclaimed rewards get implicitly transferred to Bob**, even though Alice should have retained ownership of them if they had been credited first, causing loss of funds to senders.
-
-### Root Cause
-
-The [`_transfer(...)`](https://github.com/sherlock-audit/2025-07-allbridge-core-yield/blob/main/core-auto-evm-contracts/contracts/VirtualMultiToken.sol#L28-L45) and [`_subTransfer(...)`](https://github.com/sherlock-audit/2025-07-allbridge-core-yield/blob/main/core-auto-evm-contracts/contracts/VirtualMultiToken.sol#L102-L113) functions do not call `depositRewards()` (or `subDepositRewards(index)`) prior to executing the transfer logic. As a result, the sender’s balance does not include unclaimed rewards when computing the transferred amount.
-
-### Internal Pre-conditions
-
-N/A
-
-### External Pre-conditions
-
-N/A
-
-### Attack Path
-
-N/A
-
-### Impact
-
-Loss of funds (unclaimed rewards) for the sender.
-
-### PoC
-
-```ts
-it("not depositing rewards before transfer", async () => {
-  const { token1 } = portfolioToken.getTokens();
-  const { pool1 } = portfolioToken.getPools();
-  const dToken = portfolioToken.contract;
-
-  const amount1 = floatToInt(100, 6);
-
-  await token1.connect(alice).approve(await dToken.getAddress(), amount1);
-  await dToken.connect(alice).deposit(amount1, 0);
-
-  const aliceBalance = await dToken.balanceOf(alice);
-
-  await pool1.addRewards(floatToInt(3, 6));
-  await increaseTime(24 * 60 * 60);
-
-  await dToken.connect(alice).transfer(bob, aliceBalance);
-
-  // Alice balance after transfer is 0, which is wrong as some rewards are there
-  expect(await dToken.balanceOf(alice)).to.equal(0);
-});
-```
-
-### Mitigation
-
-Ensure rewards are deposited before executing the transfers, in `PortfolioToken`, add the following:
-```solidity
-function _transfer(address from, address to, uint virtualAmount) internal virtual override {
-    depositRewards();
-    super._transfer(from, to, virtualAmount);
-}
-
-function _subTransfer(address from, address to, uint amount, uint index) internal virtual override {
-    subDepositRewards(index);
-    super._subTransfer(from, to, amount, index);
-}
-```
-
-  
-
-
-# Issue M-2: Deposit Pause Causes Unintended Withdrawal DoS 
-
-Source: https://github.com/sherlock-audit/2025-07-allbridge-core-yield-judging/issues/146 
-
-## Found by 
-Afriaudit, FalseGenius, SovaSlava, boredpukar, elolpuer, tedox
-
-### Summary
-
-Pool lets an authorised operator pause deposits (`stopDeposit)` and withdrawals (`stopWithdraw`) independently.
-`PortfolioToken.withdraw()` always calls `depositRewards()`, which in turn executes `pool.deposit(balance)` after harvesting rewards. If deposits are paused ( `canDeposit == 0` ) but withdrawals remain allowed, that internal `pool.deposit` reverts blocking every withdrawal and effectively freezing user funds.
-
-An attacker can make this inevitable by sending one extra token (worth ≥ 1 unit in system precision) to `PortfolioToken` contract, ensuring the balance check always passes even if no genuine rewards exist.
-
-### Root Cause
-
-https://github.com/sherlock-audit/2025-07-allbridge-core-yield/blob/a14f35e01b9bf8f4e5ad2b5ce1ff61dd59941e16/core-auto-evm-contracts/contracts/PortfolioToken.sol#L159
-
-```solidity
-// PortfolioToken
-uint balance = token.balanceOf(address(this));
-if ((balance / tokensPerSystem[index]) > 0) {   // true if ≥ 1 token-unit
-    pool.deposit(balance);                      // reverts if canDeposit == 0
-}
-
-```
-`PortfolioToken` never verifies `pool.canDeposit()`, nor handles the revert.
-
-### Internal Pre-conditions
-
-`Pool.canDeposit` is 0 (deposits paused).
-
-### External Pre-conditions
-
-- Any user attempts `PortfolioToken.withdraw()` and
-
-- `token.balanceOf(PortfolioToken)` ≥ `tokensPerSystem[index]` achievable either by normal reward accrual or by an attacker transferring a tiny amount to the contract.
-
-### Attack Path
-
-
-- Operator pauses deposits: Admin calls `Pool.stopDeposit()`.
-
-- (optional step) Malicious token injection; Attacker transfers arbitrary ERC-20 tokens into `PortfolioToken` But can happen due to normal rewar accrual in pool.
-
-- User attempts withdrawal; User calls `PortfolioToken.withdraw(V)`.
-
-- Blocked re-stake
-
-        `withdraw()` → `depositRewards()` → `_subDepositRewardsPoolCheck()`
-        
-        `pool.claimRewards()` succeeds.
-        
-        balance check passes (due to real rewards or injected tokens).
-        
-        `pool.deposit(balance)` reverts with "Pool: deposit prohibited".
-        
-- Withdrawal fails
-
-The entire `withdraw()` transaction reverts, trapping the user’s funds until deposits are re-enabled.
-
-### Impact
-
-DOS of withdrawal when only deposit is paused. According to Sherlock rules;
-
-> Note: if the (external) admin will unknowingly cause issues, it can be considered a valid issue
-
-### PoC
-
-_No response_
-
-### Mitigation
-
-Guard against paused deposits;
-
-```solidity
-if (pool.canDeposit() == 1 && balance > 0) {
-  pool.deposit(balance);
-}
-```
-
-# Issue M-3: Attacker can steal 100% of users deposits 
+# Issue M-1: Attacker can steal 100% of users deposits 
 
 Source: https://github.com/sherlock-audit/2025-07-allbridge-core-yield-judging/issues/173 
+
+This issue has been acknowledged by the team but won't be fixed at this time.
 
 ## Found by 
 0xEkko, 0xFlare, AshishLac, BobbyAudit, EgisSecurity, HeckerTrieuTien, LeFy, Olugbenga-ayo, Phaethon, X0sauce, alicrali33, anonymousjoe, araj, blockace, iam0ti, ivanalexandur, magiccentaur, s4bot3ur, v10g1, veerendravamshi, xiaoming90, zxriptor
@@ -239,7 +78,7 @@ Implement a new reward system which tracks how much rewards did the contract act
 
 If you are worried about dust amounts implement a onlyOwner function which sweeps any amounts from contract into the pool, that way the owner can foresee if direct transfers will hurt the system in any way
 
-# Issue M-4: No slippage control 
+# Issue M-2: No slippage control 
 
 Source: https://github.com/sherlock-audit/2025-07-allbridge-core-yield-judging/issues/241 
 
@@ -386,4 +225,14 @@ _No response_
 ### Mitigation
 
 _No response_
+
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/allbridge-public/core-auto-evm-contracts/pull/1
+
+
+
 
